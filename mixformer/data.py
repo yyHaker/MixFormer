@@ -1,12 +1,17 @@
 """
 MixFormer 数据处理模块。
 
-实现合成推荐数据集生成和 DataLoader 工厂函数。
+实现 Alibaba UserBehavior 数据集 (DIN 论文) 的加载和 DataLoader 工厂函数。
+数据来源: 天池 https://tianchi.aliyun.com/dataset/649
+字段: user_id, item_id, category_id, behavior_type, timestamp
 """
 
 from __future__ import annotations
 
-from typing import Dict, Optional
+import logging
+import os
+import pickle
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import torch
@@ -14,130 +19,179 @@ from torch.utils.data import DataLoader, Dataset
 
 from .config import MixFormerConfig
 
+logger = logging.getLogger("MixFormer.Data")
 
-class SyntheticRecDataset(Dataset):
-    """合成推荐数据集。
 
-    生成包含类别特征和用户行为序列的合成数据，用于验证模型训练和推理流程。
+# ============================================================================
+# 1. Alibaba UserBehavior 数据集
+# ============================================================================
 
-    数据包含:
-    - 非序列特征: 随机生成的类别特征 (user_id, item_id, feature_0, ...)
-    - 序列特征: 随机生成的用户历史行为序列 (物品 ID 序列)
-    - 标签: 随机生成的二分类标签 (0/1)
+
+class AlibabaDataset(Dataset):
+    """Alibaba UserBehavior 数据集。
+
+    来源: 天池 https://tianchi.aliyun.com/dataset/649
+    引用论文: Deep Interest Network for Click-Through Rate Prediction (1706.06978)
+
+    数据集包含约 1 亿条用户行为记录:
+    - user_id: 用户ID
+    - item_id: 商品ID
+    - category_id: 商品类目ID
+    - behavior_type: 行为类型 (pv/buy/cart/fav)
+    - timestamp: 行为时间戳
+
+    数据处理策略 (参考 DIN 论文):
+    1. 按用户分组，按时间排序用户的历史行为
+    2. 对每个用户的历史行为序列做 sliding window，生成训练样本:
+       - 历史行为序列: 前 t-1 个行为中的 (item_id, category_id)
+       - 目标物品: 第 t 个行为的 (item_id, category_id)
+       - 标签: 1 (正样本)
+    3. 负采样: 随机采样用户未交互的物品作为负样本 (标签: 0)
 
     Args:
+        data_dir: 预处理后的数据目录 (包含 dataset.pkl)
         config: MixFormer 模型配置
-        num_samples: 数据集样本数量
-        seed: 随机种子
+        split: 数据集拆分 ("train" | "test")
+        max_seq_length: 最大序列长度
     """
 
     def __init__(
         self,
+        data_dir: str,
         config: MixFormerConfig,
-        num_samples: int = 10000,
-        seed: int = 42,
+        split: str = "train",
+        max_seq_length: int = 50,
     ):
         super().__init__()
         self.config = config
-        self.num_samples = num_samples
+        self.split = split
+        self.max_seq_length = max_seq_length
 
-        rng = np.random.RandomState(seed)
-
-        # 生成非序列特征
-        self.non_seq_features: Dict[str, np.ndarray] = {}
-        for feat_name, vocab_size in sorted(config.vocab_sizes.items()):
-            self.non_seq_features[feat_name] = rng.randint(
-                0, vocab_size, size=(num_samples,)
+        # 加载预处理后的数据
+        data_path = os.path.join(data_dir, f"{split}_data.pkl")
+        if not os.path.exists(data_path):
+            raise FileNotFoundError(
+                f"预处理后的数据文件不存在: {data_path}\n"
+                f"请先运行 scripts/download_alibaba.py 进行数据预处理。"
             )
 
-        # 生成序列特征 (用户历史物品 ID)
-        self.seq_features = rng.randint(
-            0, config.num_items, size=(num_samples, config.seq_length)
-        )
+        logger.info(f"Loading {split} data from {data_path}...")
+        with open(data_path, "rb") as f:
+            data = pickle.load(f)
 
-        # 生成序列 mask (模拟变长序列)
-        # 每个样本的有效序列长度为 [1, seq_length]
-        seq_lengths = rng.randint(1, config.seq_length + 1, size=(num_samples,))
-        self.seq_mask = np.zeros((num_samples, config.seq_length), dtype=bool)
-        for i in range(num_samples):
-            self.seq_mask[i, : seq_lengths[i]] = True
+        self.samples = data["samples"]  # List of dicts
+        self.item_to_cate = data["item_to_cate"]  # item_id -> category_id 映射
 
-        # 生成标签 (二分类: 0 或 1)
-        # 使用轻微偏置以模拟真实 CTR 数据 (正样本比例约 5%-20%)
-        self.labels = (rng.random(num_samples) < 0.1).astype(np.float32)
+        logger.info(f"Loaded {len(self.samples)} {split} samples.")
 
     def __len__(self) -> int:
-        return self.num_samples
+        return len(self.samples)
 
     def __getitem__(self, idx: int) -> dict:
         """获取单个样本。
 
-        Returns:
-            dict 包含:
-                - non_seq_features: {feature_name: int}
-                - seq_features: (T,) int array
-                - seq_mask: (T,) bool array
-                - label: float
+        每个样本包含:
+        - target_item_id: 目标物品 ID
+        - target_cate_id: 目标物品类目 ID
+        - hist_item_ids: 历史行为物品 ID 序列 (已填充到 max_seq_length)
+        - hist_cate_ids: 历史行为类目 ID 序列 (已填充到 max_seq_length)
+        - seq_mask: 序列有效位置掩码
+        - label: 0/1 标签
         """
-        sample = {
-            "non_seq_features": {
-                feat_name: torch.tensor(feat_values[idx], dtype=torch.long)
-                for feat_name, feat_values in self.non_seq_features.items()
-            },
-            "seq_features": torch.tensor(self.seq_features[idx], dtype=torch.long),
-            "seq_mask": torch.tensor(self.seq_mask[idx], dtype=torch.bool),
-            "label": torch.tensor(self.labels[idx], dtype=torch.float32),
+        sample = self.samples[idx]
+
+        target_item_id = sample["target_item"]
+        target_cate_id = sample["target_cate"]
+        hist_items = sample["hist_items"]
+        hist_cates = sample["hist_cates"]
+        label = sample["label"]
+
+        # 截断到最大序列长度
+        seq_len = min(len(hist_items), self.max_seq_length)
+        hist_items = hist_items[-seq_len:]  # 取最近的
+        hist_cates = hist_cates[-seq_len:]
+
+        # Padding 到固定长度
+        padded_items = np.zeros(self.max_seq_length, dtype=np.int64)
+        padded_cates = np.zeros(self.max_seq_length, dtype=np.int64)
+        seq_mask = np.zeros(self.max_seq_length, dtype=bool)
+
+        padded_items[:seq_len] = hist_items
+        padded_cates[:seq_len] = hist_cates
+        seq_mask[:seq_len] = True
+
+        return {
+            "target_item_id": torch.tensor(target_item_id, dtype=torch.long),
+            "target_cate_id": torch.tensor(target_cate_id, dtype=torch.long),
+            "hist_item_ids": torch.tensor(padded_items, dtype=torch.long),
+            "hist_cate_ids": torch.tensor(padded_cates, dtype=torch.long),
+            "seq_mask": torch.tensor(seq_mask, dtype=torch.bool),
+            "label": torch.tensor(label, dtype=torch.float32),
         }
-        return sample
+
+
+# ============================================================================
+# 2. Collate Function
+# ============================================================================
 
 
 def collate_fn(batch: list[dict]) -> dict:
-    """自定义 collate 函数，处理嵌套字典结构。
+    """Alibaba 数据集的 collate 函数。
 
     Args:
         batch: 单个样本字典的列表
 
     Returns:
-        批量字典
+        批量字典，包含:
+        - target_item_id: (batch_size,) 目标物品 ID
+        - target_cate_id: (batch_size,) 目标物品类目 ID
+        - hist_item_ids: (batch_size, T) 历史物品 ID 序列
+        - hist_cate_ids: (batch_size, T) 历史类目 ID 序列
+        - seq_mask: (batch_size, T) 序列有效位置掩码
+        - label: (batch_size,) 标签
     """
-    # 收集非序列特征
-    non_seq_features = {}
-    feature_names = batch[0]["non_seq_features"].keys()
-    for feat_name in feature_names:
-        non_seq_features[feat_name] = torch.stack(
-            [sample["non_seq_features"][feat_name] for sample in batch]
-        )
-
     return {
-        "non_seq_features": non_seq_features,
-        "seq_features": torch.stack([sample["seq_features"] for sample in batch]),
-        "seq_mask": torch.stack([sample["seq_mask"] for sample in batch]),
-        "label": torch.stack([sample["label"] for sample in batch]),
+        "target_item_id": torch.stack([s["target_item_id"] for s in batch]),
+        "target_cate_id": torch.stack([s["target_cate_id"] for s in batch]),
+        "hist_item_ids": torch.stack([s["hist_item_ids"] for s in batch]),
+        "hist_cate_ids": torch.stack([s["hist_cate_ids"] for s in batch]),
+        "seq_mask": torch.stack([s["seq_mask"] for s in batch]),
+        "label": torch.stack([s["label"] for s in batch]),
     }
 
 
+# ============================================================================
+# 3. DataLoader 工厂函数
+# ============================================================================
+
+
 def create_dataloader(
+    data_dir: str,
     config: MixFormerConfig,
-    num_samples: int = 10000,
+    split: str = "train",
     batch_size: int = 256,
     shuffle: bool = True,
-    num_workers: int = 0,
-    seed: int = 42,
+    num_workers: int = 4,
 ) -> DataLoader:
-    """创建 DataLoader 的工厂函数。
+    """创建 Alibaba UserBehavior 数据集 DataLoader。
 
     Args:
+        data_dir: 预处理后的数据目录
         config: MixFormer 模型配置
-        num_samples: 数据集样本数量
+        split: 数据集拆分 ("train" | "test")
         batch_size: 批量大小
         shuffle: 是否打乱数据
         num_workers: 数据加载工作线程数
-        seed: 随机种子
 
     Returns:
         DataLoader 实例
     """
-    dataset = SyntheticRecDataset(config, num_samples=num_samples, seed=seed)
+    dataset = AlibabaDataset(
+        data_dir=data_dir,
+        config=config,
+        split=split,
+        max_seq_length=config.seq_length,
+    )
     return DataLoader(
         dataset,
         batch_size=batch_size,
@@ -145,5 +199,5 @@ def create_dataloader(
         num_workers=num_workers,
         collate_fn=collate_fn,
         pin_memory=torch.cuda.is_available(),
-        drop_last=False,
+        drop_last=(split == "train"),
     )

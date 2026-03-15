@@ -2,12 +2,17 @@
 MixFormer 训练入口脚本。
 
 实现 Trainer 类（训练循环、验证循环、指标计算、checkpoint 保存/加载、
-混合精度训练支持），支持命令行参数配置。
+混合精度训练支持），使用 Alibaba UserBehavior 数据集。
 
 Usage:
-    python train.py --config small --epochs 10 --batch_size 256
-    python train.py --config medium --epochs 20 --batch_size 128 --amp
-    python train.py --model_type ui_mixformer --config small --epochs 10
+    # 默认配置训练
+    python train.py --data_dir data/alibaba --epochs 5 --batch_size 4096
+
+    # Medium 配置训练
+    python train.py --config medium --data_dir data/alibaba --epochs 5
+
+    # 混合精度训练
+    python train.py --data_dir data/alibaba --epochs 5 --batch_size 4096 --amp
 """
 
 from __future__ import annotations
@@ -16,6 +21,7 @@ import argparse
 import json
 import logging
 import os
+import pickle
 import time
 from pathlib import Path
 from typing import Optional
@@ -27,7 +33,7 @@ from torch.utils.data import DataLoader
 
 from mixformer.config import MixFormerConfig
 from mixformer.data import create_dataloader
-from mixformer.model import MixFormer, UIMixFormer
+from mixformer.model import MixFormer
 
 # 设置日志
 logging.basicConfig(
@@ -38,15 +44,11 @@ logger = logging.getLogger("MixFormer.Train")
 
 
 def compute_auc(labels: np.ndarray, predictions: np.ndarray) -> float:
-    """计算 AUC (Area Under ROC Curve)。
-
-    使用简单实现避免 sklearn 依赖（可选）。
-    """
+    """计算 AUC (Area Under ROC Curve)。"""
     try:
         from sklearn.metrics import roc_auc_score
         import warnings
 
-        # 检查是否只有一个类别
         unique_labels = np.unique(labels)
         if len(unique_labels) < 2:
             return 0.5
@@ -55,7 +57,6 @@ def compute_auc(labels: np.ndarray, predictions: np.ndarray) -> float:
             warnings.simplefilter("ignore")
             return roc_auc_score(labels, predictions)
     except ImportError:
-        # 简单 AUC 实现 (Mann-Whitney U statistic)
         pos_indices = np.where(labels == 1)[0]
         neg_indices = np.where(labels == 0)[0]
 
@@ -65,7 +66,6 @@ def compute_auc(labels: np.ndarray, predictions: np.ndarray) -> float:
         pos_preds = predictions[pos_indices]
         neg_preds = predictions[neg_indices]
 
-        # 计算正样本排名在负样本之前的概率
         count = 0
         for p in pos_preds:
             count += np.sum(neg_preds < p) + 0.5 * np.sum(neg_preds == p)
@@ -91,7 +91,7 @@ class Trainer:
     混合精度训练支持、模型 checkpoint 保存/加载。
 
     Args:
-        model: MixFormer 或 UIMixFormer 模型
+        model: MixFormer 模型
         config: 模型配置
         train_loader: 训练数据 DataLoader
         val_loader: 验证数据 DataLoader
@@ -132,13 +132,11 @@ class Trainer:
         # 损失函数: BCE Loss
         self.criterion = nn.BCELoss()
 
-        # 优化器: RMSProp (论文中稠密部分使用)
-        self.optimizer = torch.optim.RMSprop(
+        # 优化器: Adam (工业级推荐系统常用)
+        self.optimizer = torch.optim.Adam(
             model.parameters(),
             lr=lr,
             weight_decay=weight_decay,
-            alpha=0.99,
-            eps=1e-8,
         )
 
         # 学习率调度: 带 warmup 的余弦退火
@@ -165,13 +163,23 @@ class Trainer:
     def _move_batch_to_device(self, batch: dict) -> dict:
         """将 batch 数据移动到指定设备。"""
         return {
-            "non_seq_features": {
-                k: v.to(self.device) for k, v in batch["non_seq_features"].items()
-            },
-            "seq_features": batch["seq_features"].to(self.device),
+            "target_item_id": batch["target_item_id"].to(self.device),
+            "target_cate_id": batch["target_cate_id"].to(self.device),
+            "hist_item_ids": batch["hist_item_ids"].to(self.device),
+            "hist_cate_ids": batch["hist_cate_ids"].to(self.device),
             "seq_mask": batch["seq_mask"].to(self.device),
             "label": batch["label"].to(self.device),
         }
+
+    def _forward_batch(self, batch: dict) -> torch.Tensor:
+        """执行模型前向传播。"""
+        return self.model(
+            target_item_id=batch["target_item_id"],
+            target_cate_id=batch["target_cate_id"],
+            hist_item_ids=batch["hist_item_ids"],
+            hist_cate_ids=batch["hist_cate_ids"],
+            seq_mask=batch["seq_mask"],
+        )
 
     def train_epoch(self, epoch: int) -> dict:
         """训练一个 epoch。"""
@@ -187,15 +195,12 @@ class Trainer:
             self.optimizer.zero_grad()
 
             # 前向传播
+            device_type = self.device.split(":")[0] if ":" in self.device else self.device
             with torch.amp.autocast(
-                device_type=self.device.split(":")[0] if ":" in self.device else self.device,
+                device_type=device_type,
                 enabled=self.use_amp,
             ):
-                pred = self.model(
-                    non_seq_features=batch["non_seq_features"],
-                    seq_features=batch["seq_features"],
-                    seq_mask=batch["seq_mask"],
-                )  # (batch, 1)
+                pred = self._forward_batch(batch)  # (batch, 1)
                 loss = self.criterion(pred.squeeze(-1), batch["label"])
 
             # 反向传播
@@ -251,15 +256,12 @@ class Trainer:
         for batch in self.val_loader:
             batch = self._move_batch_to_device(batch)
 
+            device_type = self.device.split(":")[0] if ":" in self.device else self.device
             with torch.amp.autocast(
-                device_type=self.device.split(":")[0] if ":" in self.device else self.device,
+                device_type=device_type,
                 enabled=self.use_amp,
             ):
-                pred = self.model(
-                    non_seq_features=batch["non_seq_features"],
-                    seq_features=batch["seq_features"],
-                    seq_mask=batch["seq_mask"],
-                )
+                pred = self._forward_batch(batch)
                 loss = self.criterion(pred.squeeze(-1), batch["label"])
 
             total_loss += loss.item()
@@ -302,6 +304,12 @@ class Trainer:
                 "dropout": self.config.dropout,
                 "user_heads": self.config.user_heads,
                 "item_heads": self.config.item_heads,
+                "num_categories": self.config.num_categories,
+                "sparse_feature_names": self.config.sparse_feature_names,
+                "sparse_vocab_sizes": self.config.sparse_vocab_sizes,
+                "sparse_embed_dim": self.config.sparse_embed_dim,
+                "use_torchrec": self.config.use_torchrec,
+                "target_item_mlp_dims": self.config.target_item_mlp_dims,
             },
         }
 
@@ -338,6 +346,9 @@ class Trainer:
         logger.info(f"Device: {self.device}")
         logger.info(f"AMP: {self.use_amp}")
         logger.info(f"Epochs: {self.epochs}")
+        logger.info(f"Train batches: {len(self.train_loader)}")
+        if self.val_loader:
+            logger.info(f"Val batches: {len(self.val_loader)}")
         logger.info("=" * 60)
 
         training_history = []
@@ -383,7 +394,7 @@ class Trainer:
                 logger.info(f"  ★ New best AUC: {current_auc:.4f}")
             logger.info("-" * 60)
 
-        # 保存训练历史（确保 numpy 类型可序列化）
+        # 保存训练历史
         history_path = self.save_dir / "training_history.json"
         serializable_history = []
         for entry in training_history:
@@ -406,38 +417,33 @@ def parse_args() -> argparse.Namespace:
     """解析命令行参数。"""
     parser = argparse.ArgumentParser(description="MixFormer Training Script")
 
+    # 数据目录
+    parser.add_argument(
+        "--data_dir",
+        type=str,
+        default="data/alibaba",
+        help="Data directory (contains train_data.pkl, test_data.pkl, meta.pkl)",
+    )
+
     # 模型配置
     parser.add_argument(
         "--config",
         type=str,
-        default="small",
-        choices=["small", "medium"],
-        help="Model configuration preset (default: small)",
-    )
-    parser.add_argument(
-        "--model_type",
-        type=str,
-        default="mixformer",
-        choices=["mixformer", "ui_mixformer"],
-        help="Model type (default: mixformer)",
+        default="default",
+        choices=["default", "medium"],
+        help="Model configuration preset (default: default)",
     )
 
     # 训练参数
     parser.add_argument("--epochs", type=int, default=10, help="Number of epochs")
     parser.add_argument("--batch_size", type=int, default=256, help="Batch size")
-    parser.add_argument("--lr", type=float, default=0.01, help="Learning rate")
+    parser.add_argument("--lr", type=float, default=0.001, help="Learning rate")
     parser.add_argument(
         "--weight_decay", type=float, default=1e-5, help="Weight decay"
     )
     parser.add_argument("--amp", action="store_true", help="Use AMP (mixed precision)")
 
     # 数据参数
-    parser.add_argument(
-        "--train_samples", type=int, default=10000, help="Training samples"
-    )
-    parser.add_argument(
-        "--val_samples", type=int, default=2000, help="Validation samples"
-    )
     parser.add_argument(
         "--num_workers", type=int, default=0, help="DataLoader num_workers"
     )
@@ -446,7 +452,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--save_dir", type=str, default="checkpoints", help="Checkpoint directory"
     )
-    parser.add_argument("--device", type=str, default="auto", help="Device (cpu/cuda/mps/auto)")
+    parser.add_argument(
+        "--device", type=str, default="auto", help="Device (cpu/cuda/mps/auto)"
+    )
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
     parser.add_argument(
         "--log_interval", type=int, default=50, help="Log interval (steps)"
@@ -461,7 +469,8 @@ def get_device(device_arg: str) -> str:
         return device_arg
     if torch.cuda.is_available():
         return "cuda"
-    if torch.backends.mps.is_available():
+    if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+        logger.info("Detected Apple MPS device, using MPS for acceleration.")
         return "mps"
     return "cpu"
 
@@ -477,37 +486,65 @@ def main():
     device = get_device(args.device)
     logger.info(f"Using device: {device}")
 
-    # 模型配置
-    if args.config == "small":
-        config = MixFormerConfig.small()
+    # 加载元数据
+    logger.info("=" * 60)
+    logger.info("MixFormer Training with Alibaba UserBehavior Dataset")
+    logger.info("=" * 60)
+
+    meta_path = os.path.join(args.data_dir, "meta.pkl")
+    if not os.path.exists(meta_path):
+        logger.error(
+            f"Metadata not found: {meta_path}\n"
+            f"Please run preprocessing first:\n"
+            f"  python scripts/download_alibaba.py --generate_mock --output_dir {args.data_dir}\n"
+            f"  or\n"
+            f"  python scripts/download_alibaba.py --raw_data_path /path/to/UserBehavior.csv --output_dir {args.data_dir}"
+        )
+        return
+
+    with open(meta_path, "rb") as f:
+        meta = pickle.load(f)
+
+    logger.info(f"Dataset metadata: {meta}")
+
+    # 创建配置 (使用实际数据的元信息)
+    if args.config == "medium":
+        config = MixFormerConfig.medium(
+            num_items=meta["num_items"] + 1,
+            num_categories=meta["num_categories"] + 1,
+            num_users=meta["num_users"] + 1,
+        )
     else:
-        config = MixFormerConfig.medium()
+        config = MixFormerConfig.default(
+            num_items=meta["num_items"] + 1,
+            num_categories=meta["num_categories"] + 1,
+            num_users=meta["num_users"] + 1,
+        )
 
     logger.info(f"Model config: {config}")
 
     # 创建数据加载器
     train_loader = create_dataloader(
-        config,
-        num_samples=args.train_samples,
+        data_dir=args.data_dir,
+        config=config,
+        split="train",
         batch_size=args.batch_size,
         shuffle=True,
         num_workers=args.num_workers,
-        seed=args.seed,
     )
+
+    # 测试集作为验证
     val_loader = create_dataloader(
-        config,
-        num_samples=args.val_samples,
+        data_dir=args.data_dir,
+        config=config,
+        split="test",
         batch_size=args.batch_size,
         shuffle=False,
         num_workers=args.num_workers,
-        seed=args.seed + 1,
     )
 
     # 创建模型
-    if args.model_type == "mixformer":
-        model = MixFormer(config)
-    else:
-        model = UIMixFormer(config)
+    model = MixFormer(config)
 
     logger.info(f"Model type: {model.__class__.__name__}")
     logger.info(f"Total parameters: {model.get_num_params():,}")

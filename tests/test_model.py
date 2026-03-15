@@ -11,8 +11,7 @@ import numpy as np
 from mixformer.config import MixFormerConfig
 from mixformer.modules import SwiGLUFFN, HeadMixing, PerHeadSwiGLUFFN
 from mixformer.layers import QueryMixer, CrossAttention, OutputFusion, MixFormerBlock
-from mixformer.model import FeatureEncoder, TaskHead, MixFormer, UIMixFormer
-from mixformer.data import SyntheticRecDataset, collate_fn, create_dataloader
+from mixformer.model import FeatureEncoder, TaskHead, MixFormer
 
 
 # ============================================================
@@ -28,15 +27,21 @@ def config():
         num_layers=2,
         hidden_dim=32,
         seq_length=10,
-        num_non_seq_features=8,
+        num_non_seq_features=4,
         feature_embed_dim=16,
         num_items=100,
         num_users=100,
+        num_categories=20,
         ffn_multiplier=2.667,
         dropout=0.0,
         user_heads=2,
         item_heads=2,
         task_head_hidden_dims=[64, 32],
+        sparse_feature_names=["item_id", "category_id"],
+        sparse_vocab_sizes=[100, 20],
+        sparse_embed_dim=32,
+        use_torchrec=False,
+        target_item_mlp_dims=[64],
     )
 
 
@@ -47,10 +52,15 @@ def batch_size():
 
 @pytest.fixture
 def sample_batch(config, batch_size):
-    """创建一个示例 batch。"""
-    dataset = SyntheticRecDataset(config, num_samples=batch_size, seed=42)
-    samples = [dataset[i] for i in range(batch_size)]
-    return collate_fn(samples)
+    """创建一个 Alibaba 格式的示例 batch。"""
+    return {
+        "target_item_id": torch.randint(1, config.num_items, (batch_size,)),
+        "target_cate_id": torch.randint(1, config.num_categories, (batch_size,)),
+        "hist_item_ids": torch.randint(0, config.num_items, (batch_size, config.seq_length)),
+        "hist_cate_ids": torch.randint(0, config.num_categories, (batch_size, config.seq_length)),
+        "seq_mask": torch.ones(batch_size, config.seq_length, dtype=torch.bool),
+        "label": torch.randint(0, 2, (batch_size,)).float(),
+    }
 
 
 # ============================================================
@@ -61,18 +71,18 @@ def sample_batch(config, batch_size):
 class TestMixFormerConfig:
     """测试模型配置。"""
 
-    def test_small_config(self):
-        config = MixFormerConfig.small()
-        assert config.num_heads == 16
-        assert config.num_layers == 4
-        assert config.hidden_dim == 386
+    def test_default_config(self):
+        config = MixFormerConfig.default()
+        assert config.num_heads == 8
+        assert config.num_layers == 3
+        assert config.hidden_dim == 64
         assert config.user_heads + config.item_heads == config.num_heads
 
     def test_medium_config(self):
         config = MixFormerConfig.medium()
-        assert config.num_heads == 16
+        assert config.num_heads == 8
         assert config.num_layers == 4
-        assert config.hidden_dim == 768
+        assert config.hidden_dim == 128
         assert config.user_heads + config.item_heads == config.num_heads
 
     def test_head_input_dim(self, config):
@@ -95,10 +105,11 @@ class TestMixFormerConfig:
                 item_heads=3,  # 3+3 != 4
             )
 
-    def test_vocab_sizes_auto(self, config):
-        assert "user_id" in config.vocab_sizes
-        assert "item_id" in config.vocab_sizes
-        assert config.vocab_sizes["user_id"] == config.num_users
+    def test_sparse_config_defaults(self):
+        config = MixFormerConfig()
+        assert config.sparse_feature_names == ["item_id", "category_id"]
+        assert config.sparse_vocab_sizes == [config.num_items, config.num_categories]
+        assert config.target_item_mlp_dims == [256]
 
     def test_repr(self, config):
         repr_str = repr(config)
@@ -282,30 +293,28 @@ class TestMixFormerBlock:
 class TestFeatureEncoder:
     """测试特征编码器。"""
 
-    def test_non_seq_encoding(self, config, batch_size):
+    def test_target_encoding(self, config, batch_size):
         encoder = FeatureEncoder(config)
-        non_seq_features = {
-            name: torch.randint(0, vs, (batch_size,))
-            for name, vs in config.vocab_sizes.items()
-        }
-        x = encoder.encode_non_seq_features(non_seq_features)
-        assert x.shape == (batch_size, config.num_heads, config.hidden_dim)
+        target_item_id = torch.randint(1, config.num_items, (batch_size,))
+        target_cate_id = torch.randint(1, config.num_categories, (batch_size,))
+        query = encoder.encode_target(target_item_id, target_cate_id)
+        assert query.shape == (batch_size, config.num_heads, config.hidden_dim)
 
-    def test_seq_encoding(self, config, batch_size):
+    def test_sequence_encoding(self, config, batch_size):
         encoder = FeatureEncoder(config)
-        seq_features = torch.randint(0, config.num_items, (batch_size, config.seq_length))
-        seq = encoder.encode_seq_features(seq_features)
+        hist_item_ids = torch.randint(0, config.num_items, (batch_size, config.seq_length))
+        hist_cate_ids = torch.randint(0, config.num_categories, (batch_size, config.seq_length))
+        seq = encoder.encode_sequence(hist_item_ids, hist_cate_ids)
         assert seq.shape == (batch_size, config.seq_length, config.model_dim)
 
     def test_full_encoding(self, config, batch_size):
         encoder = FeatureEncoder(config)
-        non_seq_features = {
-            name: torch.randint(0, vs, (batch_size,))
-            for name, vs in config.vocab_sizes.items()
-        }
-        seq_features = torch.randint(0, config.num_items, (batch_size, config.seq_length))
-        x, seq = encoder(non_seq_features, seq_features)
-        assert x.shape == (batch_size, config.num_heads, config.hidden_dim)
+        target_item_id = torch.randint(1, config.num_items, (batch_size,))
+        target_cate_id = torch.randint(1, config.num_categories, (batch_size,))
+        hist_item_ids = torch.randint(0, config.num_items, (batch_size, config.seq_length))
+        hist_cate_ids = torch.randint(0, config.num_categories, (batch_size, config.seq_length))
+        query, seq = encoder(target_item_id, target_cate_id, hist_item_ids, hist_cate_ids)
+        assert query.shape == (batch_size, config.num_heads, config.hidden_dim)
         assert seq.shape == (batch_size, config.seq_length, config.model_dim)
 
 
@@ -337,28 +346,34 @@ class TestMixFormer:
     def test_forward(self, config, sample_batch):
         model = MixFormer(config)
         pred = model(
-            non_seq_features=sample_batch["non_seq_features"],
-            seq_features=sample_batch["seq_features"],
+            target_item_id=sample_batch["target_item_id"],
+            target_cate_id=sample_batch["target_cate_id"],
+            hist_item_ids=sample_batch["hist_item_ids"],
+            hist_cate_ids=sample_batch["hist_cate_ids"],
             seq_mask=sample_batch["seq_mask"],
         )
-        batch_size = sample_batch["seq_features"].size(0)
+        batch_size = sample_batch["target_item_id"].size(0)
         assert pred.shape == (batch_size, 1)
         assert (pred >= 0).all() and (pred <= 1).all()
 
     def test_forward_no_mask(self, config, sample_batch):
         model = MixFormer(config)
         pred = model(
-            non_seq_features=sample_batch["non_seq_features"],
-            seq_features=sample_batch["seq_features"],
+            target_item_id=sample_batch["target_item_id"],
+            target_cate_id=sample_batch["target_cate_id"],
+            hist_item_ids=sample_batch["hist_item_ids"],
+            hist_cate_ids=sample_batch["hist_cate_ids"],
         )
-        batch_size = sample_batch["seq_features"].size(0)
+        batch_size = sample_batch["target_item_id"].size(0)
         assert pred.shape == (batch_size, 1)
 
     def test_backward(self, config, sample_batch):
         model = MixFormer(config)
         pred = model(
-            non_seq_features=sample_batch["non_seq_features"],
-            seq_features=sample_batch["seq_features"],
+            target_item_id=sample_batch["target_item_id"],
+            target_cate_id=sample_batch["target_cate_id"],
+            hist_item_ids=sample_batch["hist_item_ids"],
+            hist_cate_ids=sample_batch["hist_cate_ids"],
             seq_mask=sample_batch["seq_mask"],
         )
         loss = torch.nn.functional.binary_cross_entropy(
@@ -377,100 +392,6 @@ class TestMixFormer:
         assert model.get_num_trainable_params() == model.get_num_params()
 
 
-class TestUIMixFormer:
-    """测试 UI-MixFormer 解耦变体。"""
-
-    def test_forward(self, config, sample_batch):
-        model = UIMixFormer(config)
-        pred = model(
-            non_seq_features=sample_batch["non_seq_features"],
-            seq_features=sample_batch["seq_features"],
-            seq_mask=sample_batch["seq_mask"],
-        )
-        batch_size = sample_batch["seq_features"].size(0)
-        assert pred.shape == (batch_size, 1)
-        assert (pred >= 0).all() and (pred <= 1).all()
-
-    def test_decouple_mask(self, config):
-        model = UIMixFormer(config)
-        assert model.decouple_mask.shape == (config.num_heads, config.hidden_dim)
-        # 验证掩码: 用户侧头的物品部分应该为 0
-        user_mask = model.decouple_mask[: config.user_heads]
-        assert user_mask.sum() < config.user_heads * config.hidden_dim
-
-    def test_encode_user(self, config, sample_batch):
-        model = UIMixFormer(config)
-        user_repr = model.encode_user(
-            non_seq_features=sample_batch["non_seq_features"],
-            seq_features=sample_batch["seq_features"],
-            seq_mask=sample_batch["seq_mask"],
-        )
-        batch_size = sample_batch["seq_features"].size(0)
-        assert user_repr.shape == (batch_size, config.user_heads, config.hidden_dim)
-
-    def test_backward(self, config, sample_batch):
-        model = UIMixFormer(config)
-        pred = model(
-            non_seq_features=sample_batch["non_seq_features"],
-            seq_features=sample_batch["seq_features"],
-            seq_mask=sample_batch["seq_mask"],
-        )
-        loss = torch.nn.functional.binary_cross_entropy(
-            pred.squeeze(-1), sample_batch["label"]
-        )
-        loss.backward()
-
-        for name, param in model.named_parameters():
-            if param.requires_grad:
-                assert param.grad is not None, f"No gradient for {name}"
-
-
-# ============================================================
-# Data Tests
-# ============================================================
-
-
-class TestSyntheticRecDataset:
-    """测试合成数据集。"""
-
-    def test_dataset_length(self, config):
-        dataset = SyntheticRecDataset(config, num_samples=100)
-        assert len(dataset) == 100
-
-    def test_sample_structure(self, config):
-        dataset = SyntheticRecDataset(config, num_samples=10)
-        sample = dataset[0]
-        assert "non_seq_features" in sample
-        assert "seq_features" in sample
-        assert "seq_mask" in sample
-        assert "label" in sample
-
-    def test_sample_shapes(self, config):
-        dataset = SyntheticRecDataset(config, num_samples=10)
-        sample = dataset[0]
-        assert sample["seq_features"].shape == (config.seq_length,)
-        assert sample["seq_mask"].shape == (config.seq_length,)
-        assert sample["label"].shape == ()
-
-    def test_label_values(self, config):
-        dataset = SyntheticRecDataset(config, num_samples=100)
-        for i in range(len(dataset)):
-            label = dataset[i]["label"]
-            assert label.item() in [0.0, 1.0]
-
-
-class TestDataLoader:
-    """测试 DataLoader。"""
-
-    def test_create_dataloader(self, config):
-        loader = create_dataloader(config, num_samples=100, batch_size=16)
-        batch = next(iter(loader))
-        assert batch["seq_features"].shape[0] == 16
-        assert batch["seq_features"].shape[1] == config.seq_length
-        assert "non_seq_features" in batch
-        assert isinstance(batch["non_seq_features"], dict)
-
-
 # ============================================================
 # Integration Test
 # ============================================================
@@ -487,8 +408,10 @@ class TestEndToEnd:
 
         # Forward
         pred = model(
-            non_seq_features=sample_batch["non_seq_features"],
-            seq_features=sample_batch["seq_features"],
+            target_item_id=sample_batch["target_item_id"],
+            target_cate_id=sample_batch["target_cate_id"],
+            hist_item_ids=sample_batch["hist_item_ids"],
+            hist_cate_ids=sample_batch["hist_cate_ids"],
             seq_mask=sample_batch["seq_mask"],
         )
         loss = criterion(pred.squeeze(-1), sample_batch["label"])
@@ -501,37 +424,28 @@ class TestEndToEnd:
         # 验证 loss 是有限数
         assert torch.isfinite(loss)
 
-    def test_ui_mixformer_training_step(self, config, sample_batch):
-        """测试 UI-MixFormer 的一个完整训练步骤。"""
-        model = UIMixFormer(config)
-        optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
-        criterion = torch.nn.BCELoss()
-
-        pred = model(
-            non_seq_features=sample_batch["non_seq_features"],
-            seq_features=sample_batch["seq_features"],
-            seq_mask=sample_batch["seq_mask"],
-        )
-        loss = criterion(pred.squeeze(-1), sample_batch["label"])
-
-        optimizer.zero_grad()
-        loss.backward()
-        optimizer.step()
-
-        assert torch.isfinite(loss)
-
     def test_multi_step_training(self, config):
-        """测试多步训练（验证 loss 下降趋势）。"""
+        """测试多步训练（验证 loss 全部有限）。"""
         model = MixFormer(config)
         optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
         criterion = torch.nn.BCELoss()
-        loader = create_dataloader(config, num_samples=64, batch_size=16)
 
         losses = []
-        for batch in loader:
+        for _ in range(4):
+            batch = {
+                "target_item_id": torch.randint(1, config.num_items, (8,)),
+                "target_cate_id": torch.randint(1, config.num_categories, (8,)),
+                "hist_item_ids": torch.randint(0, config.num_items, (8, config.seq_length)),
+                "hist_cate_ids": torch.randint(0, config.num_categories, (8, config.seq_length)),
+                "seq_mask": torch.ones(8, config.seq_length, dtype=torch.bool),
+                "label": torch.randint(0, 2, (8,)).float(),
+            }
+
             pred = model(
-                non_seq_features=batch["non_seq_features"],
-                seq_features=batch["seq_features"],
+                target_item_id=batch["target_item_id"],
+                target_cate_id=batch["target_cate_id"],
+                hist_item_ids=batch["hist_item_ids"],
+                hist_cate_ids=batch["hist_cate_ids"],
                 seq_mask=batch["seq_mask"],
             )
             loss = criterion(pred.squeeze(-1), batch["label"])

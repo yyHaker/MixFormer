@@ -1,4 +1,6 @@
-torch>=2.10.0
+torch>=2.1.0
 numpy>=1.24.0
 tqdm>=4.65.0
 scikit-learn>=1.3.0
+torchrec>=0.6.0  # Meta TorchRec 推荐系统库 (可选, 有 nn.EmbeddingBag fallback)
+pandas>=2.0.0    # 数据预处理
