@@ -10,7 +10,7 @@ Reference: arXiv:2602.14110
 """
 
 from .config import MixFormerConfig
-from .modules import SwiGLUFFN, HeadMixing, PerHeadSwiGLUFFN
+from .modules import SwiGLUFFN, HeadMixing, PerHeadSwiGLUFFN, SparseMoE, PerHeadSparseMoE
 from .layers import QueryMixer, CrossAttention, OutputFusion, MixFormerBlock
 from .model import (
     FeatureEncoder,
@@ -27,6 +27,8 @@ __all__ = [
     "SwiGLUFFN",
     "HeadMixing",
     "PerHeadSwiGLUFFN",
+    "SparseMoE",
+    "PerHeadSparseMoE",
     "QueryMixer",
     "CrossAttention",
     "OutputFusion",
@@ -38,4 +40,4 @@ __all__ = [
     "create_dataloader",
 ]
 
-__version__ = "0.3.0"
+__version__ = "0.4.0"

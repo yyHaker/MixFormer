@@ -9,7 +9,7 @@ import torch
 import numpy as np
 
 from mixformer.config import MixFormerConfig
-from mixformer.modules import SwiGLUFFN, HeadMixing, PerHeadSwiGLUFFN
+from mixformer.modules import SwiGLUFFN, HeadMixing, PerHeadSwiGLUFFN, SparseMoE, PerHeadSparseMoE
 from mixformer.layers import QueryMixer, CrossAttention, OutputFusion, MixFormerBlock
 from mixformer.model import FeatureEncoder, TaskHead, MixFormer
 
@@ -21,7 +21,7 @@ from mixformer.model import FeatureEncoder, TaskHead, MixFormer
 
 @pytest.fixture
 def config():
-    """创建一个小型测试配置。"""
+    """创建一个小型测试配置 (使用 MoE)。"""
     return MixFormerConfig(
         num_heads=4,
         num_layers=2,
@@ -42,6 +42,36 @@ def config():
         sparse_embed_dim=32,
         use_torchrec=False,
         target_item_mlp_dims=[64],
+        use_moe=True,
+        num_experts=4,
+        num_active_experts=2,
+    )
+
+
+@pytest.fixture
+def config_no_moe():
+    """创建一个小型测试配置 (不使用 MoE)。"""
+    return MixFormerConfig(
+        num_heads=4,
+        num_layers=2,
+        hidden_dim=32,
+        seq_length=10,
+        num_non_seq_features=4,
+        feature_embed_dim=16,
+        num_items=100,
+        num_users=100,
+        num_categories=20,
+        ffn_multiplier=2.667,
+        dropout=0.0,
+        user_heads=2,
+        item_heads=2,
+        task_head_hidden_dims=[64, 32],
+        sparse_feature_names=["item_id", "category_id"],
+        sparse_vocab_sizes=[100, 20],
+        sparse_embed_dim=32,
+        use_torchrec=False,
+        target_item_mlp_dims=[64],
+        use_moe=False,
     )
 
 
@@ -401,7 +431,7 @@ class TestEndToEnd:
     """端到端集成测试。"""
 
     def test_training_step(self, config, sample_batch):
-        """测试一个完整的训练步骤。"""
+        """测试一个完整的训练步骤 (MoE 模式)。"""
         model = MixFormer(config)
         optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
         criterion = torch.nn.BCELoss()
@@ -416,12 +446,46 @@ class TestEndToEnd:
         )
         loss = criterion(pred.squeeze(-1), sample_batch["label"])
 
+        # 添加 MoE 辅助损失
+        if model.moe_aux_loss is not None:
+            loss = loss + 0.01 * model.moe_aux_loss
+
         # Backward
         optimizer.zero_grad()
         loss.backward()
         optimizer.step()
 
         # 验证 loss 是有限数
+        assert torch.isfinite(loss)
+
+    def test_training_step_no_moe(self, config_no_moe):
+        """测试一个完整的训练步骤 (标准 FFN 模式)。"""
+        model = MixFormer(config_no_moe)
+        optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
+        criterion = torch.nn.BCELoss()
+
+        batch = {
+            "target_item_id": torch.randint(1, config_no_moe.num_items, (4,)),
+            "target_cate_id": torch.randint(1, config_no_moe.num_categories, (4,)),
+            "hist_item_ids": torch.randint(0, config_no_moe.num_items, (4, config_no_moe.seq_length)),
+            "hist_cate_ids": torch.randint(0, config_no_moe.num_categories, (4, config_no_moe.seq_length)),
+            "seq_mask": torch.ones(4, config_no_moe.seq_length, dtype=torch.bool),
+            "label": torch.randint(0, 2, (4,)).float(),
+        }
+
+        pred = model(
+            target_item_id=batch["target_item_id"],
+            target_cate_id=batch["target_cate_id"],
+            hist_item_ids=batch["hist_item_ids"],
+            hist_cate_ids=batch["hist_cate_ids"],
+            seq_mask=batch["seq_mask"],
+        )
+        loss = criterion(pred.squeeze(-1), batch["label"])
+        assert model.moe_aux_loss is None  # 标准模式没有辅助损失
+
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
         assert torch.isfinite(loss)
 
     def test_multi_step_training(self, config):
@@ -449,6 +513,8 @@ class TestEndToEnd:
                 seq_mask=batch["seq_mask"],
             )
             loss = criterion(pred.squeeze(-1), batch["label"])
+            if model.moe_aux_loss is not None:
+                loss = loss + 0.01 * model.moe_aux_loss
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
@@ -456,6 +522,178 @@ class TestEndToEnd:
 
         # 验证 loss 全部有限
         assert all(np.isfinite(l) for l in losses)
+
+
+# ============================================================
+# MoE Tests
+# ============================================================
+
+
+class TestSparseMoE:
+    """测试 Sparse MoE 模块。"""
+
+    def test_output_shape(self):
+        moe = SparseMoE(in_dim=32, hidden_dim=64, num_experts=4, num_active_experts=2)
+        x = torch.randn(8, 32)
+        out = moe(x)
+        assert out.shape == (8, 32)
+
+    def test_3d_input(self):
+        moe = SparseMoE(in_dim=32, hidden_dim=64, num_experts=4, num_active_experts=2)
+        x = torch.randn(4, 10, 32)
+        out = moe(x)
+        assert out.shape == (4, 10, 32)
+
+    def test_aux_loss_training(self):
+        moe = SparseMoE(in_dim=32, hidden_dim=64, num_experts=4, num_active_experts=2)
+        moe.train()
+        x = torch.randn(8, 32)
+        out = moe(x)
+        assert moe.aux_loss is not None
+        assert moe.aux_loss.item() > 0
+
+    def test_no_aux_loss_eval(self):
+        moe = SparseMoE(in_dim=32, hidden_dim=64, num_experts=4, num_active_experts=2)
+        moe.eval()
+        x = torch.randn(8, 32)
+        out = moe(x)
+        assert moe.aux_loss is None
+
+    def test_gradient_flow(self):
+        moe = SparseMoE(in_dim=32, hidden_dim=64, num_experts=4, num_active_experts=2)
+        x = torch.randn(8, 32, requires_grad=True)
+        out = moe(x)
+        loss = out.sum()
+        if moe.aux_loss is not None:
+            loss = loss + moe.aux_loss
+        loss.backward()
+        assert x.grad is not None
+
+
+class TestPerHeadSparseMoE:
+    """测试 Per-Head Sparse MoE 模块。"""
+
+    def test_output_shape(self, config):
+        moe = PerHeadSparseMoE(
+            num_heads=config.num_heads,
+            hidden_dim=config.hidden_dim,
+            ffn_hidden_dim=config.ffn_hidden_dim,
+            num_experts=4, num_active_experts=2,
+        )
+        x = torch.randn(4, config.num_heads, config.hidden_dim)
+        out = moe(x)
+        assert out.shape == (4, config.num_heads, config.hidden_dim)
+
+    def test_aux_loss(self, config):
+        moe = PerHeadSparseMoE(
+            num_heads=config.num_heads,
+            hidden_dim=config.hidden_dim,
+            ffn_hidden_dim=config.ffn_hidden_dim,
+            num_experts=4, num_active_experts=2,
+        )
+        moe.train()
+        x = torch.randn(4, config.num_heads, config.hidden_dim)
+        out = moe(x)
+        assert moe.aux_loss is not None
+        assert moe.aux_loss.item() > 0
+
+    def test_gradient_flow(self, config):
+        moe = PerHeadSparseMoE(
+            num_heads=config.num_heads,
+            hidden_dim=config.hidden_dim,
+            ffn_hidden_dim=config.ffn_hidden_dim,
+            num_experts=4, num_active_experts=2,
+        )
+        x = torch.randn(4, config.num_heads, config.hidden_dim, requires_grad=True)
+        out = moe(x)
+        loss = out.sum()
+        if moe.aux_loss is not None:
+            loss = loss + moe.aux_loss
+        loss.backward()
+        assert x.grad is not None
+
+
+class TestFlashCrossAttention:
+    """测试 Flash Attention 版 CrossAttention。"""
+
+    def test_output_shape(self, config):
+        ca = CrossAttention(config)
+        q = torch.randn(4, config.num_heads, config.hidden_dim)
+        seq = torch.randn(4, config.seq_length, config.model_dim)
+        out = ca(q, seq)
+        assert out.shape == (4, config.num_heads, config.hidden_dim)
+
+    def test_with_mask(self, config):
+        ca = CrossAttention(config)
+        q = torch.randn(4, config.num_heads, config.hidden_dim)
+        seq = torch.randn(4, config.seq_length, config.model_dim)
+        mask = torch.ones(4, config.seq_length, dtype=torch.bool)
+        mask[:, -3:] = False
+        out = ca(q, seq, seq_mask=mask)
+        assert out.shape == (4, config.num_heads, config.hidden_dim)
+
+    def test_gradient_flow(self, config):
+        ca = CrossAttention(config)
+        q = torch.randn(4, config.num_heads, config.hidden_dim, requires_grad=True)
+        seq = torch.randn(4, config.seq_length, config.model_dim, requires_grad=True)
+        out = ca(q, seq)
+        loss = out.sum()
+        loss.backward()
+        assert q.grad is not None
+        assert seq.grad is not None
+
+
+class TestMoEMixFormer:
+    """测试带 MoE 的完整 MixFormer 模型。"""
+
+    def test_moe_aux_loss_exists(self, config, sample_batch):
+        """MoE 模式下应有辅助损失。"""
+        model = MixFormer(config)
+        model.train()
+        pred = model(
+            target_item_id=sample_batch["target_item_id"],
+            target_cate_id=sample_batch["target_cate_id"],
+            hist_item_ids=sample_batch["hist_item_ids"],
+            hist_cate_ids=sample_batch["hist_cate_ids"],
+            seq_mask=sample_batch["seq_mask"],
+        )
+        assert model.moe_aux_loss is not None
+        assert model.moe_aux_loss.item() > 0
+
+    def test_no_moe_no_aux_loss(self, config_no_moe):
+        """标准 FFN 模式下无辅助损失。"""
+        model = MixFormer(config_no_moe)
+        batch = {
+            "target_item_id": torch.randint(1, config_no_moe.num_items, (4,)),
+            "target_cate_id": torch.randint(1, config_no_moe.num_categories, (4,)),
+            "hist_item_ids": torch.randint(0, config_no_moe.num_items, (4, config_no_moe.seq_length)),
+            "hist_cate_ids": torch.randint(0, config_no_moe.num_categories, (4, config_no_moe.seq_length)),
+            "seq_mask": torch.ones(4, config_no_moe.seq_length, dtype=torch.bool),
+            "label": torch.randint(0, 2, (4,)).float(),
+        }
+        pred = model(**{k: v for k, v in batch.items() if k != "label"})
+        assert model.moe_aux_loss is None
+
+    def test_backward_with_aux_loss(self, config, sample_batch):
+        """MoE 辅助损失可以正常反向传播。"""
+        model = MixFormer(config)
+        model.train()
+        pred = model(
+            target_item_id=sample_batch["target_item_id"],
+            target_cate_id=sample_batch["target_cate_id"],
+            hist_item_ids=sample_batch["hist_item_ids"],
+            hist_cate_ids=sample_batch["hist_cate_ids"],
+            seq_mask=sample_batch["seq_mask"],
+        )
+        loss = torch.nn.functional.binary_cross_entropy(
+            pred.squeeze(-1), sample_batch["label"]
+        )
+        if model.moe_aux_loss is not None:
+            loss = loss + 0.01 * model.moe_aux_loss
+        loss.backward()
+        for name, param in model.named_parameters():
+            if param.requires_grad:
+                assert param.grad is not None, f"No gradient for {name}"
 
 
 if __name__ == "__main__":

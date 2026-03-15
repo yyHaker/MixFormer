@@ -399,7 +399,12 @@ class MixFormer(nn.Module):
     架构:
         目标物品 (item_id + cate_id) → FeatureEncoder.encode_target → Query (batch, N, D)
         历史序列 (item_ids + cate_ids) → FeatureEncoder.encode_sequence → (batch, T, N*D)
-        → L × MixFormerBlock(Query, Sequence) → TaskHead → CTR 预测
+        → L × MixFormerBlock(Query, Sequence) [Flash Attention + 可选 Sparse MoE] → TaskHead → CTR 预测
+
+    特性:
+        - CrossAttention 使用 Flash Attention (PyTorch SDPA) 加速
+        - OutputFusion 可选 Sparse MoE (Top-K 路由) 替代标准 FFN
+        - 序列处理并行化: K/V 投影合并为单次 einsum
 
     Args:
         config: MixFormer 模型配置
@@ -427,6 +432,14 @@ class MixFormer(nn.Module):
             dropout=config.dropout,
         )
 
+        # MoE 辅助损失缓存
+        self._moe_aux_loss: Optional[torch.Tensor] = None
+
+    @property
+    def moe_aux_loss(self) -> Optional[torch.Tensor]:
+        """返回所有层的 MoE 负载均衡辅助损失之和 (仅 MoE 模式 + 训练时非 None)。"""
+        return self._moe_aux_loss
+
     def forward(
         self,
         target_item_id: torch.Tensor,
@@ -453,9 +466,19 @@ class MixFormer(nn.Module):
         # query: (batch, N, D), seq: (batch, T, N*D)
 
         # 2. L 层 MixFormer Block
+        aux_losses = []
         for block in self.blocks:
             query = block(query, seq, seq_mask=seq_mask)
+            # 收集 MoE 辅助损失
+            if block.aux_loss is not None:
+                aux_losses.append(block.aux_loss)
         # query: (batch, N, D)
+
+        # 缓存辅助损失
+        if aux_losses:
+            self._moe_aux_loss = torch.stack(aux_losses).mean()
+        else:
+            self._moe_aux_loss = None
 
         # 3. 最终归一化并展平
         x = self.final_norm(query)  # (batch, N, D)

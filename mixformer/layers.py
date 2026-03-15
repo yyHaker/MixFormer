@@ -14,7 +14,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from .config import MixFormerConfig
-from .modules import HeadMixing, PerHeadSwiGLUFFN, SwiGLUFFN
+from .modules import HeadMixing, PerHeadSwiGLUFFN, PerHeadSparseMoE, SwiGLUFFN
 
 
 class QueryMixer(nn.Module):
@@ -77,16 +77,18 @@ class QueryMixer(nn.Module):
 
 
 class CrossAttention(nn.Module):
-    """Cross Attention (CA) 模块 — 序列建模核心。
+    """Cross Attention (CA) 模块 — 使用 Flash Attention 加速。
 
     用非序列特征生成的 Query 来聚合用户历史序列。
+    使用 PyTorch 2.0+ 的 scaled_dot_product_attention，
+    自动利用 FlashAttention / Memory-Efficient Attention 内核加速。
 
     流程：
     1. 序列预处理: h_t = SwiGLUFFN(Norm(s_t)) + s_t
     2. 拆分为 N 个头: h_t^i = h_t[iD:(i+1)D]
-    3. K/V 投影: k_t^i = W_k^i · h_t^i; v_t^i = W_v^i · h_t^i
-    4. Scaled Dot-Product Attention:
-       z_i = Σ softmax(q_i^T · k_t^i / √D) · v_t^i + q_i
+    3. K/V 投影 (并行): k^i, v^i = W_k^i · h^i, W_v^i · h^i
+    4. Flash Attention:
+       z_i = SDPA(q_i, k^i, v^i, attn_mask) + q_i
 
     Args:
         config: MixFormer 模型配置
@@ -107,22 +109,18 @@ class CrossAttention(nn.Module):
             dropout=config.dropout,
         )
 
-        # K/V 投影: 每个头独立的投影矩阵
-        # 使用分组线性层实现: (N, D, D)
-        self.w_k = nn.Parameter(
-            torch.empty(config.num_heads, config.hidden_dim, config.hidden_dim)
-        )
-        self.w_v = nn.Parameter(
-            torch.empty(config.num_heads, config.hidden_dim, config.hidden_dim)
+        # K/V 投影: 每个头独立的投影矩阵，打包在一起并行计算
+        # 使用单个线性层同时计算所有头的 K 和 V，提升并行度
+        self.w_kv = nn.Parameter(
+            torch.empty(config.num_heads, config.hidden_dim, 2 * config.hidden_dim)
         )
 
         self._init_weights()
 
     def _init_weights(self):
         """Xavier 初始化 K/V 投影矩阵。"""
-        for i in range(self.w_k.size(0)):
-            nn.init.xavier_uniform_(self.w_k[i])
-            nn.init.xavier_uniform_(self.w_v[i])
+        for i in range(self.w_kv.size(0)):
+            nn.init.xavier_uniform_(self.w_kv[i])
 
     def forward(
         self,
@@ -146,36 +144,34 @@ class CrossAttention(nn.Module):
         seq_normed = self.seq_norm(seq)  # (batch, T, N*D)
         seq_h = self.seq_ffn(seq_normed) + seq  # (batch, T, N*D)
 
-        # 2. 拆分为 N 个头: (batch, T, N*D) -> (batch, T, N, D)
-        seq_h = seq_h.view(batch_size, T, N, D)
+        # 2. 拆分为 N 个头: (batch, T, N*D) -> (batch, T, N, D) -> (batch, N, T, D)
+        seq_h = seq_h.view(batch_size, T, N, D).transpose(1, 2)  # (batch, N, T, D)
 
-        # 3. K/V 投影
-        # seq_h: (batch, T, N, D), w_k: (N, D, D)
-        # -> keys: (batch, T, N, D)
-        keys = torch.einsum("btnd,nde->btne", seq_h, self.w_k)  # (batch, T, N, D)
-        values = torch.einsum("btnd,nde->btne", seq_h, self.w_v)  # (batch, T, N, D)
+        # 3. K/V 并行投影: 一次 einsum 同时计算所有头的 K 和 V
+        # seq_h: (batch, N, T, D), w_kv: (N, D, 2*D)
+        kv = torch.einsum("bntd,nde->bnte", seq_h, self.w_kv)  # (batch, N, T, 2*D)
+        keys, values = kv.split(D, dim=-1)  # 各 (batch, N, T, D)
 
-        # 4. Scaled Dot-Product Attention
-        # q: (batch, N, D) -> (batch, N, 1, D) for broadcasting
-        # keys: (batch, T, N, D) -> (batch, N, T, D)
-        keys = keys.permute(0, 2, 1, 3)  # (batch, N, T, D)
-        values = values.permute(0, 2, 1, 3)  # (batch, N, T, D)
+        # 4. Flash Attention (PyTorch 2.0+ scaled_dot_product_attention)
+        # q: (batch, N, D) -> (batch, N, 1, D) 作为 query
         q_expanded = q.unsqueeze(2)  # (batch, N, 1, D)
 
-        # Attention scores: (batch, N, 1, D) @ (batch, N, D, T) -> (batch, N, 1, T)
-        attn_scores = torch.matmul(q_expanded, keys.transpose(-2, -1)) * self.scale
-        # (batch, N, 1, T)
-
-        # 应用 padding mask
+        # 构建 attention mask for SDPA
+        # seq_mask: (batch, T) -> (batch, 1, 1, T) 布尔掩码
+        attn_mask = None
         if seq_mask is not None:
-            # seq_mask: (batch, T) -> (batch, 1, 1, T)
-            mask = seq_mask.unsqueeze(1).unsqueeze(2)  # (batch, 1, 1, T)
-            attn_scores = attn_scores.masked_fill(~mask, float("-inf"))
+            attn_mask = seq_mask.unsqueeze(1).unsqueeze(2)  # (batch, 1, 1, T)
+            # 扩展到 (batch, N, 1, T) 以匹配注意力维度
+            attn_mask = attn_mask.expand(-1, N, 1, T)
 
-        attn_weights = F.softmax(attn_scores, dim=-1)  # (batch, N, 1, T)
-
-        # Weighted sum: (batch, N, 1, T) @ (batch, N, T, D) -> (batch, N, 1, D)
-        context = torch.matmul(attn_weights, values)  # (batch, N, 1, D)
+        # SDPA: 自动选择 FlashAttention / Memory-Efficient / Math 后端
+        # q_expanded: (batch, N, 1, D), keys: (batch, N, T, D), values: (batch, N, T, D)
+        context = F.scaled_dot_product_attention(
+            q_expanded, keys, values,
+            attn_mask=attn_mask,
+            dropout_p=0.0,
+            scale=self.scale,
+        )  # (batch, N, 1, D)
         context = context.squeeze(2)  # (batch, N, D)
 
         # 残差连接
@@ -188,7 +184,11 @@ class OutputFusion(nn.Module):
     """Output Fusion (OF) 模块。
 
     对 Cross Attention 的输出进行深度融合：
-    o_i = SwiGLUFFN_i(Norm(z_i)) + z_i
+    o_i = FFN_i(Norm(z_i)) + z_i
+
+    支持两种模式：
+    - 标准模式 (use_moe=False): 使用 PerHeadSwiGLUFFN
+    - MoE 模式 (use_moe=True): 使用 PerHeadSparseMoE (Sparse Mixture of Experts)
 
     Args:
         config: MixFormer 模型配置
@@ -196,14 +196,33 @@ class OutputFusion(nn.Module):
 
     def __init__(self, config: MixFormerConfig):
         super().__init__()
+        self.use_moe = config.use_moe
 
         self.norm = nn.RMSNorm(config.hidden_dim)
-        self.per_head_ffn = PerHeadSwiGLUFFN(
-            num_heads=config.num_heads,
-            hidden_dim=config.hidden_dim,
-            ffn_hidden_dim=config.ffn_hidden_dim,
-            dropout=config.dropout,
-        )
+
+        if config.use_moe:
+            self.moe_ffn = PerHeadSparseMoE(
+                num_heads=config.num_heads,
+                hidden_dim=config.hidden_dim,
+                ffn_hidden_dim=config.ffn_hidden_dim,
+                num_experts=config.num_experts,
+                num_active_experts=config.num_active_experts,
+                dropout=config.dropout,
+            )
+        else:
+            self.per_head_ffn = PerHeadSwiGLUFFN(
+                num_heads=config.num_heads,
+                hidden_dim=config.hidden_dim,
+                ffn_hidden_dim=config.ffn_hidden_dim,
+                dropout=config.dropout,
+            )
+
+    @property
+    def aux_loss(self) -> Optional[torch.Tensor]:
+        """返回 MoE 辅助损失 (仅 MoE 模式下可用)。"""
+        if self.use_moe:
+            return self.moe_ffn.aux_loss
+        return None
 
     def forward(self, z: torch.Tensor) -> torch.Tensor:
         """
@@ -214,14 +233,17 @@ class OutputFusion(nn.Module):
             o: (batch, N, D) — 融合后的输出
         """
         normed = self.norm(z)  # (batch, N, D)
-        o = self.per_head_ffn(normed) + z  # (batch, N, D)
+        if self.use_moe:
+            o = self.moe_ffn(normed) + z  # (batch, N, D)
+        else:
+            o = self.per_head_ffn(normed) + z  # (batch, N, D)
         return o
 
 
 class MixFormerBlock(nn.Module):
     """单个 MixFormer Block。
 
-    按顺序执行: QueryMixer -> CrossAttention -> OutputFusion
+    按顺序执行: QueryMixer -> CrossAttention (Flash Attention) -> OutputFusion (可选 MoE)
 
     Args:
         config: MixFormer 模型配置
@@ -232,6 +254,11 @@ class MixFormerBlock(nn.Module):
         self.query_mixer = QueryMixer(config)
         self.cross_attention = CrossAttention(config)
         self.output_fusion = OutputFusion(config)
+
+    @property
+    def aux_loss(self) -> Optional[torch.Tensor]:
+        """返回本层 MoE 辅助损失。"""
+        return self.output_fusion.aux_loss
 
     def forward(
         self,
@@ -253,10 +280,10 @@ class MixFormerBlock(nn.Module):
         # 1. Query Mixer
         q = self.query_mixer(x, mask=decouple_mask)  # (batch, N, D)
 
-        # 2. Cross Attention
+        # 2. Cross Attention (Flash Attention)
         z = self.cross_attention(q, seq, seq_mask)  # (batch, N, D)
 
-        # 3. Output Fusion
+        # 3. Output Fusion (可选 MoE)
         o = self.output_fusion(z)  # (batch, N, D)
 
         return o

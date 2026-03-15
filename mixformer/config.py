@@ -62,6 +62,12 @@ class MixFormerConfig:
     user_heads: int = 4
     item_heads: int = 4
 
+    # MoE (Mixture of Experts) 参数
+    use_moe: bool = True           # 是否在 OutputFusion 中使用 Sparse MoE 替代 FFN
+    num_experts: int = 4           # 专家数量
+    num_active_experts: int = 2    # Top-K: 每次激活的专家数量
+    moe_aux_loss_weight: float = 0.01  # 负载均衡辅助损失权重
+
     # 任务头参数
     task_head_hidden_dims: Optional[list] = None
 
@@ -221,6 +227,12 @@ class MixFormerConfig:
         )
 
     def __repr__(self) -> str:
+        moe_str = ""
+        if self.use_moe:
+            moe_str = (
+                f"  use_moe={self.use_moe}, num_experts={self.num_experts}, "
+                f"num_active_experts={self.num_active_experts},\n"
+            )
         return (
             f"MixFormerConfig(\n"
             f"  num_heads={self.num_heads}, num_layers={self.num_layers}, "
@@ -230,6 +242,7 @@ class MixFormerConfig:
             f"  sparse_embed_dim={self.sparse_embed_dim}, "
             f"use_torchrec={self.use_torchrec},\n"
             f"  ffn_hidden_dim={self.ffn_hidden_dim}, dropout={self.dropout},\n"
+            f"{moe_str}"
             f"  user_heads={self.user_heads}, item_heads={self.item_heads}\n"
             f")"
         )

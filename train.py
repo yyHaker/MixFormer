@@ -128,6 +128,7 @@ class Trainer:
         self.use_amp = use_amp
         self.device = device
         self.log_interval = log_interval
+        self.moe_aux_loss_weight = config.moe_aux_loss_weight
 
         # 损失函数: BCE Loss
         self.criterion = nn.BCELoss()
@@ -202,6 +203,10 @@ class Trainer:
             ):
                 pred = self._forward_batch(batch)  # (batch, 1)
                 loss = self.criterion(pred.squeeze(-1), batch["label"])
+
+                # 添加 MoE 负载均衡辅助损失
+                if hasattr(self.model, 'moe_aux_loss') and self.model.moe_aux_loss is not None:
+                    loss = loss + self.moe_aux_loss_weight * self.model.moe_aux_loss
 
             # 反向传播
             self.scaler.scale(loss).backward()
@@ -310,6 +315,10 @@ class Trainer:
                 "sparse_embed_dim": self.config.sparse_embed_dim,
                 "use_torchrec": self.config.use_torchrec,
                 "target_item_mlp_dims": self.config.target_item_mlp_dims,
+                "use_moe": self.config.use_moe,
+                "num_experts": self.config.num_experts,
+                "num_active_experts": self.config.num_active_experts,
+                "moe_aux_loss_weight": self.config.moe_aux_loss_weight,
             },
         }
 
@@ -345,6 +354,15 @@ class Trainer:
         logger.info(f"Trainable parameters: {self.model.get_num_trainable_params():,}")
         logger.info(f"Device: {self.device}")
         logger.info(f"AMP: {self.use_amp}")
+        logger.info(f"Flash Attention: enabled (PyTorch SDPA)")
+        if self.config.use_moe:
+            logger.info(
+                f"Sparse MoE: enabled (experts={self.config.num_experts}, "
+                f"active={self.config.num_active_experts}, "
+                f"aux_weight={self.config.moe_aux_loss_weight})"
+            )
+        else:
+            logger.info("Sparse MoE: disabled (standard FFN)")
         logger.info(f"Epochs: {self.epochs}")
         logger.info(f"Train batches: {len(self.train_loader)}")
         if self.val_loader:
